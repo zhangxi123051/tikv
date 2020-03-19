@@ -1,91 +1,100 @@
-// Copyright 2018 PingCAP, Inc.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright 2018 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::error;
-use std::result;
-use std::time::Duration;
+use crate::storage;
+use crate::storage::kv::{Error as KvError, ErrorInner as KvErrorInner};
+use crate::storage::mvcc::{Error as MvccError, ErrorInner as MvccErrorInner};
+use crate::storage::txn::{Error as TxnError, ErrorInner as TxnErrorInner};
 
-use kvproto::{errorpb, kvrpcpb};
-use tipb;
+#[derive(Fail, Debug)]
+pub enum Error {
+    #[fail(display = "Region error (will back off and retry) {:?}", _0)]
+    Region(kvproto::errorpb::Error),
 
-use coprocessor;
-use storage;
+    #[fail(display = "Key is locked (will clean up) {:?}", _0)]
+    Locked(kvproto::kvrpcpb::LockInfo),
 
-quick_error! {
-    #[derive(Debug)]
-    pub enum Error {
-        Region(err: errorpb::Error) {
-            description("region related failure")
-            display("region {:?}", err)
-        }
-        Locked(l: kvrpcpb::LockInfo) {
-            description("key is locked")
-            display("locked {:?}", l)
-        }
-        Outdated(elapsed: Duration, tag: &'static str) {
-            description("request is outdated")
-        }
-        Full(allow: usize) {
-            description("running queue is full")
-        }
-        Eval(err: tipb::select::Error) {
-            from()
-            description("eval failed")
-            display("eval error {:?}", err)
-        }
-        Other(err: Box<error::Error + Send + Sync>) {
-            from()
-            cause(err.as_ref())
-            description(err.description())
-            display("unknown error {:?}", err)
+    #[fail(display = "Coprocessor task terminated due to exceeding the deadline")]
+    DeadlineExceeded,
+
+    #[fail(display = "Coprocessor task canceled due to exceeding max pending tasks")]
+    MaxPendingTasksExceeded,
+
+    #[fail(display = "{}", _0)]
+    Other(String),
+}
+
+impl From<Box<dyn std::error::Error + Send + Sync>> for Error {
+    #[inline]
+    fn from(err: Box<dyn std::error::Error + Send + Sync>) -> Self {
+        Error::Other(err.to_string())
+    }
+}
+
+impl From<Error> for tidb_query::error::StorageError {
+    fn from(err: Error) -> Self {
+        failure::Error::from(err).into()
+    }
+}
+
+impl From<tidb_query::error::StorageError> for Error {
+    fn from(err: tidb_query::error::StorageError) -> Self {
+        match err.0.downcast::<Error>() {
+            Ok(e) => e,
+            Err(e) => box_err!("Unknown storage error: {}", e),
         }
     }
 }
 
-pub type Result<T> = result::Result<T, Error>;
+impl From<tidb_query::error::EvaluateError> for Error {
+    fn from(err: tidb_query::error::EvaluateError) -> Self {
+        Error::Other(err.to_string())
+    }
+}
 
-impl From<storage::engine::Error> for Error {
-    fn from(e: storage::engine::Error) -> Error {
-        match e {
-            storage::engine::Error::Request(e) => Error::Region(e),
-            _ => Error::Other(box e),
+impl From<tidb_query::Error> for Error {
+    fn from(err: tidb_query::Error) -> Self {
+        use tidb_query::error::ErrorInner;
+
+        match *err.0 {
+            ErrorInner::Storage(err) => err.into(),
+            ErrorInner::Evaluate(err) => err.into(),
         }
     }
 }
 
-impl From<coprocessor::dag::expr::Error> for Error {
-    fn from(e: coprocessor::dag::expr::Error) -> Error {
-        Error::Eval(e.into())
-    }
-}
-
-impl From<storage::txn::Error> for Error {
-    fn from(e: storage::txn::Error) -> Error {
-        match e {
-            storage::txn::Error::Mvcc(storage::mvcc::Error::KeyIsLocked {
-                primary,
-                ts,
-                key,
-                ttl,
-            }) => {
-                let mut info = kvrpcpb::LockInfo::new();
-                info.set_primary_lock(primary);
-                info.set_lock_version(ts);
-                info.set_key(key);
-                info.set_lock_ttl(ttl);
-                Error::Locked(info)
-            }
-            _ => Error::Other(box e),
+impl From<KvError> for Error {
+    fn from(err: KvError) -> Self {
+        match err {
+            KvError(box KvErrorInner::Request(e)) => Error::Region(e),
+            e => Error::Other(e.to_string()),
         }
     }
 }
+
+impl From<MvccError> for Error {
+    fn from(err: MvccError) -> Self {
+        match err {
+            MvccError(box MvccErrorInner::KeyIsLocked(info)) => Error::Locked(info),
+            MvccError(box MvccErrorInner::Engine(engine_error)) => Error::from(engine_error),
+            e => Error::Other(e.to_string()),
+        }
+    }
+}
+
+impl From<TxnError> for Error {
+    fn from(err: storage::txn::Error) -> Self {
+        match err {
+            TxnError(box TxnErrorInner::Mvcc(mvcc_error)) => Error::from(mvcc_error),
+            TxnError(box TxnErrorInner::Engine(engine_error)) => Error::from(engine_error),
+            e => Error::Other(e.to_string()),
+        }
+    }
+}
+
+impl From<tikv_util::deadline::DeadlineError> for Error {
+    fn from(_: tikv_util::deadline::DeadlineError) -> Self {
+        Error::DeadlineExceeded
+    }
+}
+
+pub type Result<T> = std::result::Result<T, Error>;

@@ -1,41 +1,54 @@
 <!--
-Thank you for contributing to TiKV! Please read TiKV's [CONTRIBUTING](https://github.com/pingcap/tikv/blob/master/CONTRIBUTING.md) document **BEFORE** filing this PR.
+Thank you for contributing to TiKV!
+
+If you haven't already, please read TiKV's [CONTRIBUTING](https://github.com/tikv/tikv/blob/master/CONTRIBUTING.md) document.
+
+If you're unsure about anything, just ask; somebody should be along to answer within a day or two.
 -->
 
-## What have you changed? (mandatory)
+###  What have you changed?
 
-Please explain **IN DETAIL** what the changes are in this PR and why they are needed:
-- Summarize your change (mandatory)
-- How does this PR work? Need a brief introduction for the changed logic (optional)
-- Separately describe each logical change and avoid lazy messages (optional)
+Please explain in detail what the changes are in this PR and why they are needed:
+
+- Summarize your change
+- How does this PR work? Include a brief introduction for any changed logic (optional)
+- Separately describe each logical change (optional)
 - Describe any limitations of the current code (optional)
 
-Please **NOTE** that:
-- Do not assume reviewers understand the original issue
+Don't assume reviewers understand the original issue.
 
-## What are the type of the changes? (mandatory)
+###  What is the type of the changes?
+<!--
+Pick one of the following and delete the others:
+-->
+- New feature (a change which adds functionality)
+- Improvement (a change which is an improvement to an existing feature)
+- Bugfix (a change which fixes an issue)
+- Engineering (engineering change which doesn't change any feature or fix any issue)
+- Misc (other changes)
 
-The currently defined types are listed below, please pick one of the types for this PR by removing the others:
-- New feature (non-breaking change which adds functionality)
-- Improvement (non-breaking change which is an improvement to an existing feature)
-- Bug fix (non-breaking change which fixes an issue)
-- Breaking change (fix or feature that would cause existing functionality to not work as expected)
+###  How is the PR tested?
+<!--
+Please select the tests that you ran to verify your changes:
+-->
+- Unit test
+- Integration test
+- Manual test (add detailed scripts or steps below)
+- No code
 
-## How has this PR been tested? (mandatory)
+###  Does this PR affect documentation (docs) or should it be mentioned in the release notes?
+<!--
+- If there is a document change, please file a PR in ([docs](https://github.com/tikv/website/tree/master/content)) and add the PR number here.
+- If this PR should be mentioned in the release note, please update the [release notes](https://github.com/tikv/tikv/blob/master/CHANGELOG.md).
+-->
 
-Please describe the tests that you ran to verify your changes. Have you finished unit tests, integration tests, or manual tests? What additional tests would give you greater confidence in this change?
-
-## Does this PR affect documentation (docs/docs-cn) update? (mandatory)
-
-If there is document change, please file a PR in ([docs](https://github.com/pingcap/docs) or [docs-cn](https://github.com/pingcap/docs-cn)) and add the PR number here.
-
-## Does this PR affect tidb-ansible update? (mandatory)
-
+###  Does this PR affect `tidb-ansible`?
+<!--
 If there is a configuration or metrics change, please file a PR in [tidb-ansible](https://github.com/pingcap/tidb-ansible), and add the PR number here.
+-->
+###  Refer to a related PR or issue link (optional)
 
-## Refer to a related PR or issue link (optional)
+###  Benchmark result if necessary (optional)
 
-## Benchmark result if necessary (optional)
-
-## Add a few positive/negative examples (optional)
+###  Any examples? (optional)
 

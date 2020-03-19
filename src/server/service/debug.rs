@@ -1,41 +1,32 @@
-// Copyright 2017 PingCAP, Inc.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright 2017 TiKV Project Authors. Licensed under Apache-2.0.
 
+use engine::rocks::util::stats as rocksdb_stats;
+use engine::Engines;
 use fail;
-use futures::sync::oneshot;
 use futures::{future, stream, Future, Stream};
-use futures_cpupool::{Builder, CpuPool};
-use grpc::{Error as GrpcError, WriteFlags};
-use grpc::{RpcContext, RpcStatus, RpcStatusCode, ServerStreamingSink, UnarySink};
-use kvproto::debugpb::*;
-use kvproto::debugpb_grpc;
+use futures_cpupool::CpuPool;
+use grpcio::{Error as GrpcError, WriteFlags};
+use grpcio::{RpcContext, RpcStatus, RpcStatusCode, ServerStreamingSink, UnarySink};
+use kvproto::debugpb::{self, *};
 use kvproto::raft_cmdpb::{
     AdminCmdType, AdminRequest, RaftCmdRequest, RaftRequestHeader, RegionDetailResponse,
     StatusCmdType, StatusRequest,
 };
-use protobuf::text_format::print_to_string;
+use tokio_sync::oneshot;
 
+use crate::server::debug::{Debugger, Error};
+use crate::server::gc_worker::GcWorkerConfigManager;
+use raftstore::router::RaftStoreRouter;
 use raftstore::store::msg::Callback;
-use raftstore::store::Engines;
-use server::debug::{Debugger, Error};
-use server::transport::RaftStoreRouter;
-use util::{jemalloc, metrics, rocksdb_stats};
+use tikv_util::metrics;
+
+use tikv_alloc;
 
 fn error_to_status(e: Error) -> RpcStatus {
     let (code, msg) = match e {
-        Error::NotFound(msg) => (RpcStatusCode::NotFound, Some(msg)),
-        Error::InvalidArgument(msg) => (RpcStatusCode::InvalidArgument, Some(msg)),
-        Error::Other(e) => (RpcStatusCode::Unknown, Some(format!("{:?}", e))),
+        Error::NotFound(msg) => (RpcStatusCode::NOT_FOUND, Some(msg)),
+        Error::InvalidArgument(msg) => (RpcStatusCode::INVALID_ARGUMENT, Some(msg)),
+        Error::Other(e) => (RpcStatusCode::UNKNOWN, Some(format!("{:?}", e))),
     };
     RpcStatus::new(code, msg)
 }
@@ -51,29 +42,40 @@ fn error_to_grpc_error(tag: &'static str, e: Error) -> GrpcError {
     e
 }
 
+/// Service handles the RPC messages for the `Debug` service.
 #[derive(Clone)]
 pub struct Service<T: RaftStoreRouter> {
     pool: CpuPool,
     debugger: Debugger,
     raft_router: T,
+    dynamic_config: bool,
 }
 
 impl<T: RaftStoreRouter> Service<T> {
-    pub fn new(engines: Engines, raft_router: T) -> Service<T> {
-        let pool = Builder::new()
-            .name_prefix(thd_name!("debugger"))
-            .pool_size(1)
-            .create();
-        let debugger = Debugger::new(engines);
+    /// Constructs a new `Service` with `Engines`, a `RaftStoreRouter` and a `GcWorker`.
+    pub fn new(
+        engines: Engines,
+        pool: CpuPool,
+        raft_router: T,
+        gc_worker_cfg: GcWorkerConfigManager,
+        dynamic_config: bool,
+    ) -> Service<T> {
+        let debugger = Debugger::new(engines, Some(gc_worker_cfg));
         Service {
             pool,
             debugger,
             raft_router,
+            dynamic_config,
         }
     }
 
-    fn handle_response<F, P>(&self, ctx: RpcContext, sink: UnarySink<P>, resp: F, tag: &'static str)
-    where
+    fn handle_response<F, P>(
+        &self,
+        ctx: RpcContext<'_>,
+        sink: UnarySink<P>,
+        resp: F,
+        tag: &'static str,
+    ) where
         P: Send + 'static,
         F: Future<Item = P, Error = Error> + Send + 'static,
     {
@@ -85,8 +87,8 @@ impl<T: RaftStoreRouter> Service<T> {
     }
 }
 
-impl<T: RaftStoreRouter + 'static + Send> debugpb_grpc::Debug for Service<T> {
-    fn get(&self, ctx: RpcContext, mut req: GetRequest, sink: UnarySink<GetResponse>) {
+impl<T: RaftStoreRouter + 'static> debugpb::Debug for Service<T> {
+    fn get(&mut self, ctx: RpcContext<'_>, mut req: GetRequest, sink: UnarySink<GetResponse>) {
         const TAG: &str = "debug_get";
 
         let db = req.get_db();
@@ -100,7 +102,7 @@ impl<T: RaftStoreRouter + 'static + Send> debugpb_grpc::Debug for Service<T> {
                     .and_then(move |debugger| debugger.get(db, &cf, key.as_slice())),
             )
             .map(|value| {
-                let mut resp = GetResponse::new();
+                let mut resp = GetResponse::default();
                 resp.set_value(value);
                 resp
             });
@@ -108,7 +110,12 @@ impl<T: RaftStoreRouter + 'static + Send> debugpb_grpc::Debug for Service<T> {
         self.handle_response(ctx, sink, f, TAG);
     }
 
-    fn raft_log(&self, ctx: RpcContext, req: RaftLogRequest, sink: UnarySink<RaftLogResponse>) {
+    fn raft_log(
+        &mut self,
+        ctx: RpcContext<'_>,
+        req: RaftLogRequest,
+        sink: UnarySink<RaftLogResponse>,
+    ) {
         const TAG: &str = "debug_raft_log";
 
         let region_id = req.get_region_id();
@@ -121,7 +128,7 @@ impl<T: RaftStoreRouter + 'static + Send> debugpb_grpc::Debug for Service<T> {
                     .and_then(move |debugger| debugger.raft_log(region_id, log_index)),
             )
             .map(|entry| {
-                let mut resp = RaftLogResponse::new();
+                let mut resp = RaftLogResponse::default();
                 resp.set_entry(entry);
                 resp
             });
@@ -130,8 +137,8 @@ impl<T: RaftStoreRouter + 'static + Send> debugpb_grpc::Debug for Service<T> {
     }
 
     fn region_info(
-        &self,
-        ctx: RpcContext,
+        &mut self,
+        ctx: RpcContext<'_>,
         req: RegionInfoRequest,
         sink: UnarySink<RegionInfoResponse>,
     ) {
@@ -146,7 +153,7 @@ impl<T: RaftStoreRouter + 'static + Send> debugpb_grpc::Debug for Service<T> {
                     .and_then(move |debugger| debugger.region_info(region_id)),
             )
             .map(|region_info| {
-                let mut resp = RegionInfoResponse::new();
+                let mut resp = RegionInfoResponse::default();
                 if let Some(raft_local_state) = region_info.raft_local_state {
                     resp.set_raft_local_state(raft_local_state);
                 }
@@ -163,15 +170,15 @@ impl<T: RaftStoreRouter + 'static + Send> debugpb_grpc::Debug for Service<T> {
     }
 
     fn region_size(
-        &self,
-        ctx: RpcContext,
+        &mut self,
+        ctx: RpcContext<'_>,
         mut req: RegionSizeRequest,
         sink: UnarySink<RegionSizeResponse>,
     ) {
         const TAG: &str = "debug_region_size";
 
         let region_id = req.get_region_id();
-        let cfs = req.take_cfs().into_vec();
+        let cfs = req.take_cfs().into();
 
         let f = self
             .pool
@@ -180,12 +187,12 @@ impl<T: RaftStoreRouter + 'static + Send> debugpb_grpc::Debug for Service<T> {
                     .and_then(move |debugger| debugger.region_size(region_id, cfs)),
             )
             .map(|entries| {
-                let mut resp = RegionSizeResponse::new();
+                let mut resp = RegionSizeResponse::default();
                 resp.set_entries(
                     entries
                         .into_iter()
                         .map(|(cf, size)| {
-                            let mut entry = RegionSizeResponse_Entry::new();
+                            let mut entry = region_size_response::Entry::default();
                             entry.set_cf(cf);
                             entry.set_size(size as u64);
                             entry
@@ -199,8 +206,8 @@ impl<T: RaftStoreRouter + 'static + Send> debugpb_grpc::Debug for Service<T> {
     }
 
     fn scan_mvcc(
-        &self,
-        _: RpcContext,
+        &mut self,
+        _: RpcContext<'_>,
         mut req: ScanMvccRequest,
         sink: ServerStreamingSink<ScanMvccResponse>,
     ) {
@@ -214,7 +221,7 @@ impl<T: RaftStoreRouter + 'static + Send> debugpb_grpc::Debug for Service<T> {
                 stream::iter_result(iter)
                     .map_err(|e| error_to_grpc_error("scan_mvcc", e))
                     .map(|(key, mvcc_info)| {
-                        let mut resp = ScanMvccResponse::new();
+                        let mut resp = ScanMvccResponse::default();
                         resp.set_key(key);
                         resp.set_info(mvcc_info);
                         (resp, WriteFlags::default())
@@ -226,7 +233,12 @@ impl<T: RaftStoreRouter + 'static + Send> debugpb_grpc::Debug for Service<T> {
         self.pool.spawn(future).forget();
     }
 
-    fn compact(&self, ctx: RpcContext, req: CompactRequest, sink: UnarySink<CompactResponse>) {
+    fn compact(
+        &mut self,
+        ctx: RpcContext<'_>,
+        req: CompactRequest,
+        sink: UnarySink<CompactResponse>,
+    ) {
         let debugger = self.debugger.clone();
         let f = self.pool.spawn_fn(move || {
             debugger
@@ -236,6 +248,7 @@ impl<T: RaftStoreRouter + 'static + Send> debugpb_grpc::Debug for Service<T> {
                     req.get_from_key(),
                     req.get_to_key(),
                     req.get_threads(),
+                    req.get_bottommost_level_compaction().into(),
                 )
                 .map(|_| CompactResponse::default())
         });
@@ -243,8 +256,8 @@ impl<T: RaftStoreRouter + 'static + Send> debugpb_grpc::Debug for Service<T> {
     }
 
     fn inject_fail_point(
-        &self,
-        ctx: RpcContext,
+        &mut self,
+        ctx: RpcContext<'_>,
         mut req: InjectFailPointRequest,
         sink: UnarySink<InjectFailPointResponse>,
     ) {
@@ -259,15 +272,15 @@ impl<T: RaftStoreRouter + 'static + Send> debugpb_grpc::Debug for Service<T> {
             if let Err(e) = fail::cfg(name, actions) {
                 return Err(box_err!("{:?}", e));
             }
-            Ok(InjectFailPointResponse::new())
+            Ok(InjectFailPointResponse::default())
         });
 
         self.handle_response(ctx, sink, f, TAG);
     }
 
     fn recover_fail_point(
-        &self,
-        ctx: RpcContext,
+        &mut self,
+        ctx: RpcContext<'_>,
         mut req: RecoverFailPointRequest,
         sink: UnarySink<RecoverFailPointResponse>,
     ) {
@@ -279,15 +292,15 @@ impl<T: RaftStoreRouter + 'static + Send> debugpb_grpc::Debug for Service<T> {
                 return Err(Error::InvalidArgument("Failure Type INVALID".to_owned()));
             }
             fail::remove(name);
-            Ok(RecoverFailPointResponse::new())
+            Ok(RecoverFailPointResponse::default())
         });
 
         self.handle_response(ctx, sink, f, TAG);
     }
 
     fn list_fail_points(
-        &self,
-        ctx: RpcContext,
+        &mut self,
+        ctx: RpcContext<'_>,
         _: ListFailPointsRequest,
         sink: UnarySink<ListFailPointsResponse>,
     ) {
@@ -295,12 +308,12 @@ impl<T: RaftStoreRouter + 'static + Send> debugpb_grpc::Debug for Service<T> {
 
         let f = self.pool.spawn_fn(move || {
             let list = fail::list().into_iter().map(|(name, actions)| {
-                let mut entry = ListFailPointsResponse_Entry::new();
+                let mut entry = list_fail_points_response::Entry::default();
                 entry.set_name(name);
                 entry.set_actions(actions);
                 entry
             });
-            let mut resp = ListFailPointsResponse::new();
+            let mut resp = ListFailPointsResponse::default();
             resp.set_entries(list.collect());
             Ok(resp)
         });
@@ -309,8 +322,8 @@ impl<T: RaftStoreRouter + 'static + Send> debugpb_grpc::Debug for Service<T> {
     }
 
     fn get_metrics(
-        &self,
-        ctx: RpcContext,
+        &mut self,
+        ctx: RpcContext<'_>,
         req: GetMetricsRequest,
         sink: UnarySink<GetMetricsResponse>,
     ) {
@@ -318,13 +331,14 @@ impl<T: RaftStoreRouter + 'static + Send> debugpb_grpc::Debug for Service<T> {
 
         let debugger = self.debugger.clone();
         let f = self.pool.spawn_fn(move || {
-            let mut resp = GetMetricsResponse::new();
+            let mut resp = GetMetricsResponse::default();
+            resp.set_store_id(debugger.get_store_id()?);
             resp.set_prometheus(metrics::dump());
             if req.get_all() {
                 let engines = debugger.get_engine();
-                resp.set_rocksdb_kv(box_try!(rocksdb_stats::dump(&engines.kv_engine)));
-                resp.set_rocksdb_raft(box_try!(rocksdb_stats::dump(&engines.raft_engine)));
-                resp.set_jemalloc(jemalloc::dump_stats());
+                resp.set_rocksdb_kv(box_try!(rocksdb_stats::dump(&engines.kv)));
+                resp.set_rocksdb_raft(box_try!(rocksdb_stats::dump(&engines.raft)));
+                resp.set_jemalloc(tikv_alloc::dump_stats());
             }
             Ok(resp)
         });
@@ -333,8 +347,8 @@ impl<T: RaftStoreRouter + 'static + Send> debugpb_grpc::Debug for Service<T> {
     }
 
     fn check_region_consistency(
-        &self,
-        ctx: RpcContext,
+        &mut self,
+        ctx: RpcContext<'_>,
         req: RegionConsistencyCheckRequest,
         sink: UnarySink<RegionConsistencyCheckResponse>,
     ) {
@@ -349,17 +363,25 @@ impl<T: RaftStoreRouter + 'static + Send> debugpb_grpc::Debug for Service<T> {
         let f = self
             .pool
             .spawn(consistency_check)
-            .map(|_| RegionConsistencyCheckResponse::new());
+            .map(|_| RegionConsistencyCheckResponse::default());
         self.handle_response(ctx, sink, f, "check_region_consistency");
     }
 
     fn modify_tikv_config(
-        &self,
-        ctx: RpcContext,
+        &mut self,
+        ctx: RpcContext<'_>,
         mut req: ModifyTikvConfigRequest,
         sink: UnarySink<ModifyTikvConfigResponse>,
     ) {
         const TAG: &str = "modify_tikv_config";
+
+        if self.dynamic_config {
+            let msg =
+                "Dynamic config feature is enabled, please modify tikv config through PD instead";
+            let status = RpcStatus::new(RpcStatusCode::UNAVAILABLE, Some(msg.to_owned()));
+            ctx.spawn(sink.fail(status).map_err(move |e| on_grpc_error(TAG, &e)));
+            return;
+        }
 
         let module = req.get_module();
         let config_name = req.take_config_name();
@@ -370,35 +392,75 @@ impl<T: RaftStoreRouter + 'static + Send> debugpb_grpc::Debug for Service<T> {
             .spawn(future::ok(self.debugger.clone()).and_then(move |debugger| {
                 debugger.modify_tikv_config(module, &config_name, &config_value)
             }))
-            .map(|_| ModifyTikvConfigResponse::new());
+            .map(|_| ModifyTikvConfigResponse::default());
 
         self.handle_response(ctx, sink, f, TAG);
     }
 
     fn get_region_properties(
-        &self,
-        ctx: RpcContext,
+        &mut self,
+        ctx: RpcContext<'_>,
         req: GetRegionPropertiesRequest,
         sink: UnarySink<GetRegionPropertiesResponse>,
     ) {
         const TAG: &str = "get_region_properties";
+        let debugger = self.debugger.clone();
 
         let f = self
             .pool
-            .spawn(
-                future::ok(self.debugger.clone())
-                    .and_then(move |debugger| debugger.get_region_properties(req.get_region_id())),
-            )
+            .spawn_fn(move || debugger.get_region_properties(req.get_region_id()))
             .map(|props| {
-                let mut resp = GetRegionPropertiesResponse::new();
+                let mut resp = GetRegionPropertiesResponse::default();
                 for (name, value) in props {
-                    let mut prop = Property::new();
+                    let mut prop = Property::default();
                     prop.set_name(name);
                     prop.set_value(value);
                     resp.mut_props().push(prop);
                 }
                 resp
             });
+
+        self.handle_response(ctx, sink, f, TAG);
+    }
+
+    fn get_store_info(
+        &mut self,
+        ctx: RpcContext<'_>,
+        _: GetStoreInfoRequest,
+        sink: UnarySink<GetStoreInfoResponse>,
+    ) {
+        const TAG: &str = "debug_get_store_id";
+        let debugger = self.debugger.clone();
+
+        let f = self.pool.spawn_fn(move || {
+            let mut resp = GetStoreInfoResponse::default();
+            match debugger.get_store_id() {
+                Ok(store_id) => resp.set_store_id(store_id),
+                Err(_) => resp.set_store_id(0),
+            }
+            Ok(resp)
+        });
+
+        self.handle_response(ctx, sink, f, TAG);
+    }
+
+    fn get_cluster_info(
+        &mut self,
+        ctx: RpcContext<'_>,
+        _: GetClusterInfoRequest,
+        sink: UnarySink<GetClusterInfoResponse>,
+    ) {
+        const TAG: &str = "debug_get_cluster_id";
+        let debugger = self.debugger.clone();
+
+        let f = self.pool.spawn_fn(move || {
+            let mut resp = GetClusterInfoResponse::default();
+            match debugger.get_cluster_id() {
+                Ok(cluster_id) => resp.set_cluster_id(cluster_id),
+                Err(_) => resp.set_cluster_id(0),
+            }
+            Ok(resp)
+        });
 
         self.handle_response(ctx, sink, f, TAG);
     }
@@ -409,36 +471,36 @@ fn region_detail<T: RaftStoreRouter>(
     region_id: u64,
     store_id: u64,
 ) -> impl Future<Item = RegionDetailResponse, Error = Error> {
-    let mut header = RaftRequestHeader::new();
+    let mut header = RaftRequestHeader::default();
     header.set_region_id(region_id);
     header.mut_peer().set_store_id(store_id);
-    let mut status_request = StatusRequest::new();
+    let mut status_request = StatusRequest::default();
     status_request.set_cmd_type(StatusCmdType::RegionDetail);
-    let mut raft_cmd = RaftCmdRequest::new();
+    let mut raft_cmd = RaftCmdRequest::default();
     raft_cmd.set_header(header);
     raft_cmd.set_status_request(status_request);
 
     let (tx, rx) = oneshot::channel();
-    let cb = Callback::Read(box |resp| tx.send(resp).unwrap());
+    let cb = Callback::Read(Box::new(|resp| tx.send(resp).unwrap()));
     future::result(raft_router.send_command(raft_cmd, cb))
-        .map_err(|e| Error::Other(box e))
+        .map_err(|e| Error::Other(Box::new(e)))
         .and_then(move |_| {
-            rx.map_err(|e| Error::Other(box e)).and_then(move |mut r| {
-                if r.response.get_header().has_error() {
-                    let e = r.response.get_header().get_error();
-                    warn!("region_detail got error: {:?}", e);
-                    let msg = print_to_string(e);
-                    return Err(Error::Other(msg.into()));
-                }
-                let detail = r.response.take_status_response().take_region_detail();
-                debug!("region_detail got region detail: {:?}", detail);
-                let leader_store_id = detail.get_leader().get_store_id();
-                if leader_store_id != store_id {
-                    let msg = format!("Leader is on store {}", leader_store_id);
-                    return Err(Error::Other(msg.into()));
-                }
-                Ok(detail)
-            })
+            rx.map_err(|e| Error::Other(Box::new(e)))
+                .and_then(move |mut r| {
+                    if r.response.get_header().has_error() {
+                        let e = r.response.get_header().get_error();
+                        warn!("region_detail got error"; "err" => ?e);
+                        return Err(Error::Other(e.message.clone().into()));
+                    }
+                    let detail = r.response.take_status_response().take_region_detail();
+                    debug!("region_detail got region detail"; "detail" => ?detail);
+                    let leader_store_id = detail.get_leader().get_store_id();
+                    if leader_store_id != store_id {
+                        let msg = format!("Leader is on store {}", leader_store_id);
+                        return Err(Error::Other(msg.into()));
+                    }
+                    Ok(detail)
+                })
         })
 }
 
@@ -446,28 +508,38 @@ fn consistency_check<T: RaftStoreRouter>(
     raft_router: T,
     mut detail: RegionDetailResponse,
 ) -> impl Future<Item = (), Error = Error> {
-    let mut header = RaftRequestHeader::new();
+    let mut header = RaftRequestHeader::default();
     header.set_region_id(detail.get_region().get_id());
     header.set_peer(detail.take_leader());
-    let mut admin_request = AdminRequest::new();
+    let mut admin_request = AdminRequest::default();
     admin_request.set_cmd_type(AdminCmdType::ComputeHash);
-    let mut raft_cmd = RaftCmdRequest::new();
+    let mut raft_cmd = RaftCmdRequest::default();
     raft_cmd.set_header(header);
     raft_cmd.set_admin_request(admin_request);
 
     let (tx, rx) = oneshot::channel();
-    let cb = Callback::Read(box |resp| tx.send(resp).unwrap());
+    let cb = Callback::Read(Box::new(|resp| tx.send(resp).unwrap()));
     future::result(raft_router.send_command(raft_cmd, cb))
-        .map_err(|e| Error::Other(box e))
+        .map_err(|e| Error::Other(Box::new(e)))
         .and_then(move |_| {
-            rx.map_err(|e| Error::Other(box e)).and_then(move |r| {
-                if r.response.get_header().has_error() {
-                    let e = r.response.get_header().get_error();
-                    warn!("consistency-check got error: {:?}", e);
-                    let msg = print_to_string(e);
-                    return Err(Error::Other(msg.into()));
-                }
-                Ok(())
-            })
+            rx.map_err(|e| Error::Other(Box::new(e)))
+                .and_then(move |r| {
+                    if r.response.get_header().has_error() {
+                        let e = r.response.get_header().get_error();
+                        warn!("consistency-check got error"; "err" => ?e);
+                        return Err(Error::Other(e.message.clone().into()));
+                    }
+                    Ok(())
+                })
         })
+}
+
+#[cfg(feature = "protobuf-codec")]
+mod region_size_response {
+    pub type Entry = kvproto::debugpb::RegionSizeResponseEntry;
+}
+
+#[cfg(feature = "protobuf-codec")]
+mod list_fail_points_response {
+    pub type Entry = kvproto::debugpb::ListFailPointsResponseEntry;
 }
